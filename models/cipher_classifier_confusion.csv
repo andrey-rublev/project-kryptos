@@ -1,0 +1,5 @@
+,caesar,vigenere,skip,columnar
+caesar,6,0,5,0
+vigenere,0,1,4,0
+skip,0,0,13,0
+columnar,1,0,7,3
