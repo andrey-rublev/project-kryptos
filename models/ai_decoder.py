@@ -1,104 +1,80 @@
-# ai_decoder_safe.py
-import os
+"""Batch-decode every ciphertext in one or more CSV files.
+
+Reads CSVs that contain an ``encrypted_sentence`` column (the format produced by
+the ``encode/`` generators) and writes ``cipher``, ``key`` and ``plaintext`` for
+each row using the ``kryptos`` cryptanalysis package.
+
+    python models/ai_decoder.py data/output/caesar.csv --limit 100
+    python models/ai_decoder.py data/output/*.csv -o decoded.csv
+"""
+
+import argparse
 import csv
-import importlib
-import torch
-from cipher_classifier import CipherClassifier, encode_text, VOCAB_SIZE, CIPHERS
-from models.key_predictor_caesar_train import CaesarKeyPredictor, encode_text as encode_text_key
+import glob
+import os
+import sys
 
-DATA_DIR = r"C:\Users\nikhi\Downloads\Kryptos\data\output"
-DECODE_FOLDER = r"C:\Users\nikhi\Downloads\Kryptos\decode"
-CLASSIFIER_MODEL_PATH = r"C:\Users\nikhi\Downloads\Kryptos\models\cipher_classifier.pt"
-CAESAR_KEY_MODEL_PATH = r"C:\Users\nikhi\Downloads\Kryptos\models\key_predictor_caesar.pt"
-PROCESSED_LOG = os.path.join(DATA_DIR, "processed_files.txt")  # tracks processed CSVs
-OUTPUT_FILE = os.path.join(DATA_DIR, "decoded_results.csv")
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+from kryptos.fitness import get_fitness  # noqa: E402
+from kryptos.pipeline import decode      # noqa: E402
 
-cipher_classifier = CipherClassifier(VOCAB_SIZE)
-cipher_classifier.load_state_dict(torch.load(CLASSIFIER_MODEL_PATH, map_location=device))
-cipher_classifier.to(device)
-cipher_classifier.eval()
+COLUMN = "encrypted_sentence"
 
-key_models = {}
-key_models["caesar"] = CaesarKeyPredictor(VOCAB_SIZE)
-key_models["caesar"].load_state_dict(torch.load(CAESAR_KEY_MODEL_PATH, map_location=device))
-key_models["caesar"].to(device)
-key_models["caesar"].eval()
 
-def predict_cipher(text):
-    with torch.no_grad():
-        encoded = torch.tensor([encode_text(text)], dtype=torch.long).to(device)
-        logits = cipher_classifier(encoded)
-        pred = torch.argmax(logits, dim=1).item()
-        return CIPHERS[pred]
+def iter_rows(paths, limit):
+    seen = 0
+    for path in paths:
+        with open(path, "r", encoding="utf-8") as f:
+            reader = csv.DictReader(f)
+            if COLUMN not in (reader.fieldnames or []):
+                print(f"  skip {path}: no '{COLUMN}' column", file=sys.stderr)
+                continue
+            for row in reader:
+                yield os.path.basename(path), row
+                seen += 1
+                if limit and seen >= limit:
+                    return
 
-def predict_key(cipher_name, text):
-    model = key_models[cipher_name]
-    with torch.no_grad():
-        encoded = torch.tensor([encode_text_key(text)], dtype=torch.long).to(device)
-        logits = model(encoded)
-        pred = torch.argmax(logits, dim=1).item()
-        return pred
 
-def decode_text(cipher_name, key, ciphertext):
-    decoder = importlib.import_module(f'decode.{cipher_name}')
-    return decoder.decrypt(ciphertext, key)
+def main():
+    p = argparse.ArgumentParser(description=__doc__,
+                                formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("inputs", nargs="+", help="CSV file(s) or globs to decode")
+    p.add_argument("-o", "--output", default="data/output/decoded_results.csv")
+    p.add_argument("--limit", type=int, default=0, help="max rows total (0 = all)")
+    args = p.parse_args()
 
-if os.path.exists(PROCESSED_LOG):
-    with open(PROCESSED_LOG, "r") as f:
-        processed_files = set(line.strip() for line in f.readlines())
-else:
-    processed_files = set()
+    paths = []
+    for pattern in args.inputs:
+        paths.extend(sorted(glob.glob(pattern)) or [pattern])
 
-csv_files = [f for f in os.listdir(DATA_DIR) if f.endswith(".csv") and f not in processed_files]
-print(f"Files to process: {csv_files}")
+    fit = get_fitness()
+    os.makedirs(os.path.dirname(os.path.abspath(args.output)), exist_ok=True)
 
-decoded_results = []
-
-for fname in csv_files:
-    path = os.path.join(DATA_DIR, fname)
-    with open(path, "r", encoding="utf-8") as f:
-        reader = csv.DictReader(f)
-        for row in reader:
-            ciphertext = row["encrypted_sentence"]
-
-            predicted_cipher = predict_cipher(ciphertext)
-
-            # Only Caesar implemented here; extend for others
-            if predicted_cipher == "caesar":
-                predicted_key = predict_key(predicted_cipher, ciphertext)
-                plaintext = decode_text(predicted_cipher, predicted_key, ciphertext)
-            else:
-                predicted_key = "N/A"
-                plaintext = "N/A"
-
-            decoded_results.append({
-                "ciphertext": ciphertext,
-                "cipher": predicted_cipher,
-                "key": predicted_key,
-                "plaintext": plaintext
-            })
-
-    # Update processed log
-    processed_files.add(fname)
-    with open(PROCESSED_LOG, "a") as f_log:
-        f_log.write(fname + "\n")
-
-fieldnames = ["ciphertext", "cipher", "key", "plaintext"]
-
-if os.path.exists(OUTPUT_FILE):
-    # Append new results
-    with open(OUTPUT_FILE, "a", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames)
-        for row in decoded_results:
-            writer.writerow(row)
-else:
-    # Create new CSV
-    with open(OUTPUT_FILE, "w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames)
+    n_ok = 0
+    with open(args.output, "w", newline="", encoding="utf-8") as out:
+        writer = csv.DictWriter(out, fieldnames=[
+            "source", "ciphertext", "true_cipher", "predicted_cipher",
+            "key", "confidence", "plaintext"])
         writer.writeheader()
-        for row in decoded_results:
-            writer.writerow(row)
+        for source, row in iter_rows(paths, args.limit):
+            ct = row[COLUMN]
+            result = decode(ct, fit)
+            writer.writerow({
+                "source": source,
+                "ciphertext": ct,
+                "true_cipher": row.get("cipher", ""),
+                "predicted_cipher": result.cipher,
+                "key": result.key,
+                "confidence": f"{result.confidence:.3f}",
+                "plaintext": result.plaintext,
+            })
+            n_ok += 1
+            if row.get("cipher") == result.cipher:
+                pass
+    print(f"Decoded {n_ok} rows -> {args.output}")
 
-print(f"Decoded {len(decoded_results)} entries. Results saved to {OUTPUT_FILE}")
+
+if __name__ == "__main__":
+    main()

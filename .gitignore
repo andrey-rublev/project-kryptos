@@ -1,0 +1,17 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.venv/
+venv/
+
+# Generated datasets (regenerate with encode/*.py)
+data/output/*.csv
+data/output/decoded_results.csv
+data/output/processed_files.txt
+
+# Large/raw corpus input
+data/input/
+
+# Note: kryptos/data/english_stats.npz IS committed (small, needed at runtime)
